@@ -1,6 +1,20 @@
 [package]
 name = "breeze-asr-rs"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+description = "A Rust-based library for MediaTek Breeze ASR (Whisper-large-v2 finetune) using ONNX Runtime."
+license = "MIT"
 
 [dependencies]
+ort = { version = "2.0.0-rc.10", features = ["ndarray", "load-dynamic"] }
+ndarray = "0.16"
+hound = "3.5.1"
+rubato = "0.16.0"
+rustfft = "6.2.0"
+hf-hub = "0.3.2"
+regex = "1.10.2"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.36", features = ["full", "rt-multi-thread"] }
