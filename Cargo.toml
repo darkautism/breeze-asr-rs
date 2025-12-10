@@ -17,5 +17,14 @@ thiserror = "2.0.17"
 anyhow = "1.0"
 base64 = "0.22"
 
+# Stream dependencies
+voice_activity_detector = { version = "0.2.1", optional = true }
+futures = { version = "0.3.31", optional = true }
+async-stream = { version = "0.3.6", optional = true }
+
+[features]
+default = []
+stream = ["dep:voice_activity_detector", "dep:futures", "dep:async-stream"]
+
 [dev-dependencies]
 tokio = { version = "1.36", features = ["full", "rt-multi-thread"] }

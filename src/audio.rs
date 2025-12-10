@@ -33,14 +33,27 @@ impl AudioProcessor {
     pub fn load_and_preprocess(&self, path: &str) -> Result<Array2<f32>> {
         println!("Loading audio from: {}", path);
         let (samples, sr) = read_wav(path)?;
+        // Just call process_pcm with the samples and their original sample rate
+        // We do the resampling here if needed because process_pcm expects input ready for log_mel_spectrogram?
+        // Wait, log_mel_spectrogram expects 16kHz.
+        // So I should do resampling in process_pcm or before?
+        // load_and_preprocess used to do resampling before log_mel_spectrogram.
+        // I will make process_pcm take &[f32] which ARE already 16kHz, OR make it take SR?
+        // To be flexible for streaming (which is usually 16kHz), let's assume process_pcm takes 16kHz.
+        // But better to be explicit.
+        
         let resampled = if sr != SAMPLE_RATE {
             resample_audio(&samples, sr, SAMPLE_RATE)?
         } else {
             samples
         };
+        
+        Ok(self.process_pcm(&resampled))
+    }
 
-        let log_spec = self.log_mel_spectrogram(&resampled);
-        Ok(log_spec)
+    /// Process PCM audio samples (must be 16kHz).
+    pub fn process_pcm(&self, samples: &[f32]) -> Array2<f32> {
+        self.log_mel_spectrogram(samples)
     }
 
     fn log_mel_spectrogram(&self, audio: &[f32]) -> Array2<f32> {

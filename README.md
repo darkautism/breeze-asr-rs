@@ -9,7 +9,7 @@
 
 請見examples
 
-```
+```Rust
 use breeze_asr_rs::BreezeASR;
 use std::env;
 
@@ -36,3 +36,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+該庫還額外內建一個流式輸入，整合了一個vad。可以調整最長句子和無聲長度判斷。
+需要該功能請打開stream功能。
