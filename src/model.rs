@@ -1,12 +1,17 @@
 use std::sync::Mutex;
+use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{Session, builder::GraphOptimizationLevel, SessionInputValue},
     value::Tensor,
 };
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array1, Array2, Array3, Array4, Axis};
 
 const SOT: i64 = 50258;
+const EOT: i64 = 50257;
+const MAX_LEN: usize = 448;
+const N_LAYER: usize = 32;
+const D_MODEL: usize = 1280;
 
 pub struct BreezeModel {
     encoder: Mutex<Session>,
@@ -25,75 +30,110 @@ impl BreezeModel {
             .with_intra_threads(4)?
             .commit_from_file(decoder_path)?;
 
-        Ok(Self {
-            encoder: Mutex::new(encoder),
-            decoder: Mutex::new(decoder)
+        Ok(Self { 
+            encoder: Mutex::new(encoder), 
+            decoder: Mutex::new(decoder) 
         })
     }
 
     pub fn infer(&self, mel: &Array2<f32>) -> Result<Vec<i64>> {
-        // 1. Encoder
+        // === 1. Encoder ===
         let batch_mel = mel.view().insert_axis(Axis(0));
-
-        let enc_tensor = {
+        
+        let (cross_k, cross_v) = {
             let inputs = ort::inputs![
                 "mel" => Tensor::from_array(batch_mel.to_owned())?,
             ];
 
             let mut encoder_session = self.encoder.lock().map_err(|e| anyhow!("Failed to lock encoder: {}", e))?;
             let encoder_out = encoder_session.run(inputs)?;
+            
+            // Helper to convert output to owned Tensor
+            fn extract_to_tensor(out: &ort::value::DynValue) -> Result<Tensor<f32>> {
+                let (shape, data) = out.try_extract_tensor::<f32>()?;
+                let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                // We know it is 4D [32, 1, 1500, 1280] usually
+                let array = Array4::from_shape_vec(
+                    (shape_vec[0], shape_vec[1], shape_vec[2], shape_vec[3]),
+                    data.to_vec()
+                )?;
+                Ok(Tensor::from_array(array)?)
+            }
 
-            let (enc_shape, enc_data) = encoder_out[0].try_extract_tensor::<f32>()?;
-            // Copy data out to a new Tensor that owns its data, decoupling from session
-            Tensor::from_array(
-                Array3::from_shape_vec(
-                    (enc_shape[0] as usize, enc_shape[1] as usize, enc_shape[2] as usize),
-                    enc_data.to_vec()
-                )?
-            )?
-            // encoder_out and inputs dropped here
-            // encoder_session dropped here (unlocks)
+            let k_owned = extract_to_tensor(&encoder_out["n_layer_cross_k"])?;
+            let v_owned = extract_to_tensor(&encoder_out["n_layer_cross_v"])?;
+            
+            (k_owned, v_owned)
         };
 
-        // 2. Decoder Loop (Greedy)
-        let mut tokens = vec![SOT];
-        let max_len = 448;
-
+        // === 2. Decoder Loop (Greedy) ===
+        let mut tokens = vec![SOT]; 
+        
         let mut decoder_session = self.decoder.lock().map_err(|e| anyhow!("Failed to lock decoder: {}", e))?;
 
-        for _ in 0..max_len {
-            let input_ids = Array2::from_shape_vec(
-                (1, tokens.len()),
-                tokens.clone()
-            )?;
+        let mut self_k_cache = Array4::<f32>::zeros((N_LAYER, 1, MAX_LEN, D_MODEL));
+        let mut self_v_cache = Array4::<f32>::zeros((N_LAYER, 1, MAX_LEN, D_MODEL));
 
-            let inputs = ort::inputs![
-                "input_ids" => Tensor::from_array(input_ids)?,
-                "encoder_hidden_states" => enc_tensor.clone(),
-            ];
+        for i in 0..MAX_LEN {
+            let offset = i as i64;
+            let current_token = *tokens.last().unwrap();
+            let token_input = Array2::from_shape_vec((1, 1), vec![current_token])?;
+            let offset_input = Array1::from_shape_vec((1,), vec![offset])?;
+
+            let mut inputs: HashMap<String, SessionInputValue<'_>> = HashMap::new();
+            inputs.insert("tokens".to_string(), Tensor::from_array(token_input)?.into());
+            inputs.insert("in_n_layer_self_k_cache".to_string(), Tensor::from_array(self_k_cache.clone())?.into());
+            inputs.insert("in_n_layer_self_v_cache".to_string(), Tensor::from_array(self_v_cache.clone())?.into());
+            inputs.insert("n_layer_cross_k".to_string(), cross_k.clone().into());
+            inputs.insert("n_layer_cross_v".to_string(), cross_v.clone().into());
+            inputs.insert("offset".to_string(), Tensor::from_array(offset_input)?.into());
 
             let outputs = match decoder_session.run(inputs) {
                 Ok(o) => o,
-                Err(e) => return Err(anyhow!("Decoder run failed: {}. Check if model expects past_key_values.", e)),
+                Err(e) => return Err(anyhow!("Decoder run failed at step {}: {}", i, e)),
             };
 
-            let (out_shape, out_data) = outputs[0].try_extract_tensor::<f32>()?;
-            let vocab_size = out_shape[2] as usize;
-            let seq_len = out_shape[1] as usize;
-
-            let logits = &out_data[(seq_len - 1) * vocab_size .. seq_len * vocab_size];
-
-            let (next_token, _) = logits.iter().enumerate().fold(
-                (0, f32::NEG_INFINITY),
-                |(argmax, max), (i, &val)| if val > max { (i, val) } else { (argmax, max) }
-            );
-
-            let next_token = next_token as i64;
-
-            if next_token == 50257 { // EOT
-                break;
+            // Process outputs
+            {
+                let (shape, data) = outputs["out_n_layer_self_k_cache"].try_extract_tensor::<f32>()?;
+                // Should match [32, 1, 448, 1280]
+                let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                let out_arr = Array4::from_shape_vec(
+                    (shape_vec[0], shape_vec[1], shape_vec[2], shape_vec[3]),
+                    data.to_vec()
+                )?;
+                self_k_cache.assign(&out_arr);
+            }
+            {
+                let (shape, data) = outputs["out_n_layer_self_v_cache"].try_extract_tensor::<f32>()?;
+                let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                let out_arr = Array4::from_shape_vec(
+                    (shape_vec[0], shape_vec[1], shape_vec[2], shape_vec[3]),
+                    data.to_vec()
+                )?;
+                self_v_cache.assign(&out_arr);
             }
 
+            let next_token = {
+                let (shape, data) = outputs["logits"].try_extract_tensor::<f32>()?;
+                // Shape [1, 1, Vocab]
+                let shape_vec: Vec<usize> = shape.iter().map(|&x| x as usize).collect();
+                let logits_arr = Array3::from_shape_vec(
+                    (shape_vec[0], shape_vec[1], shape_vec[2]),
+                    data.to_vec()
+                )?;
+                
+                let logits_slice = logits_arr.slice(ndarray::s![0, 0, ..]);
+                let (token, _) = logits_slice.iter().enumerate().fold(
+                    (0, f32::NEG_INFINITY), 
+                    |(argmax, max), (i, &val)| if val > max { (i, val) } else { (argmax, max) }
+                );
+                token as i64
+            };
+
+            if next_token == EOT {
+                break;
+            }
             tokens.push(next_token);
         }
 

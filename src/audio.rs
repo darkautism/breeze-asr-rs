@@ -3,7 +3,7 @@ use ndarray::{Array1, Array2};
 use rustfft::{FftPlanner, num_complex::Complex};
 use rubato::{Resampler, SincFixedIn, SincInterpolationType, SincInterpolationParameters, WindowFunction};
 use hound::WavReader;
-use anyhow::Result;
+use anyhow::{Result, Context};
 
 // Whisper parameters
 const SAMPLE_RATE: usize = 16000;
@@ -31,6 +31,7 @@ impl AudioProcessor {
     }
 
     pub fn load_and_preprocess(&self, path: &str) -> Result<Array2<f32>> {
+        println!("Loading audio from: {}", path);
         let (samples, sr) = read_wav(path)?;
         let resampled = if sr != SAMPLE_RATE {
             resample_audio(&samples, sr, SAMPLE_RATE)?
@@ -43,10 +44,7 @@ impl AudioProcessor {
     }
 
     fn log_mel_spectrogram(&self, audio: &[f32]) -> Array2<f32> {
-        // Pad audio to N_SAMPLES if needed, or slice it.
-        // For simplicity, we process the first 30s. If longer, caller should handle chunking.
-        // But Whisper usually pads short audio.
-
+        // Pad audio to N_SAMPLES if needed, or slice it. 
         let mut padded_audio = audio.to_vec();
         if padded_audio.len() < N_SAMPLES {
             padded_audio.resize(N_SAMPLES, 0.0);
@@ -57,35 +55,44 @@ impl AudioProcessor {
         // STFT
         let window = hann_window(N_FFT);
         let stft_out = stft(&padded_audio, N_FFT, HOP_LENGTH, &window);
-
+        
         // Magnitudes squared
         let magnitudes = stft_out.mapv(|c| c.norm_sqr());
         // Apply only up to N_FFT/2 + 1
         let magnitudes = magnitudes.slice(ndarray::s![.., ..(N_FFT / 2 + 1)]);
 
         // Mel transform: [Time, Freq] x [Freq, Mel] -> [Time, Mel]
-        // But standard Whisper expects [Mel, Time].
-        // My filters are [Freq, Mel].
-        // magnitudes is [Time, Freq].
-        // dot: [Time, Freq] . [Freq, Mel] = [Time, Mel]
         let mel_spec = magnitudes.dot(&self.mel_filters);
-
+        
         // Log10
         let mut log_spec = mel_spec.mapv(|x| (x.max(1e-10)).log10());
 
         // Standard scaling for Whisper:
-        // log_spec = torch.maximum(log_spec, log_spec.max() - 8.0)
         // log_spec = (log_spec + 4.0) / 4.0
         let max_val = log_spec.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
         log_spec.mapv_inplace(|x| (x.max(max_val - 8.0) + 4.0) / 4.0);
 
+        // Ensure exactly 3000 frames
+        let current_frames = log_spec.shape()[0];
+        let target_frames = 3000;
+        
+        let final_spec = if current_frames < target_frames {
+            let mut padded = Array2::zeros((target_frames, N_MELS));
+            padded.slice_mut(ndarray::s![..current_frames, ..]).assign(&log_spec);
+            padded
+        } else if current_frames > target_frames {
+            log_spec.slice(ndarray::s![..target_frames, ..]).to_owned()
+        } else {
+            log_spec
+        };
+
         // Transpose to [Mel, Time] -> [80, 3000]
-        log_spec.t().to_owned()
+        final_spec.t().to_owned()
     }
 }
 
 fn read_wav(path: &str) -> Result<(Vec<f32>, usize)> {
-    let mut reader = WavReader::open(path)?;
+    let mut reader = WavReader::open(path).with_context(|| format!("Failed to open wav file '{}'", path))?;
     let spec = reader.spec();
     let samples: Vec<f32> = reader
         .samples::<i16>()
@@ -102,11 +109,11 @@ fn resample_audio(samples: &[f32], from_sr: usize, to_sr: usize) -> Result<Vec<f
         oversampling_factor: 256,
         window: WindowFunction::BlackmanHarris2,
     };
-
+    
     let ratio = to_sr as f64 / from_sr as f64;
     let mut resampler = SincFixedIn::<f32>::new(
         ratio,
-        ratio, // max_resample_ratio
+        ratio, 
         params,
         samples.len(),
         1,
@@ -126,7 +133,7 @@ fn hann_window(size: usize) -> Array1<f32> {
 fn stft(input: &[f32], n_fft: usize, hop_length: usize, window: &Array1<f32>) -> Array2<Complex<f32>> {
     let n_frames = (input.len() - n_fft) / hop_length + 1;
     let mut output = Array2::<Complex<f32>>::zeros((n_frames, n_fft));
-
+    
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(n_fft);
 
@@ -134,7 +141,7 @@ fn stft(input: &[f32], n_fft: usize, hop_length: usize, window: &Array1<f32>) ->
         let start = i * hop_length;
         let end = start + n_fft;
         let mut frame = input[start..end].to_vec();
-
+        
         // Apply window
         for (j, val) in frame.iter_mut().enumerate() {
             *val *= window[j];
@@ -142,7 +149,7 @@ fn stft(input: &[f32], n_fft: usize, hop_length: usize, window: &Array1<f32>) ->
 
         let mut complex_frame: Vec<Complex<f32>> = frame.iter().map(|&x| Complex::new(x, 0.0)).collect();
         fft.process(&mut complex_frame);
-
+        
         let mut row_view = row;
         for (j, c) in complex_frame.iter().enumerate() {
             row_view[j] = *c;
@@ -158,7 +165,7 @@ fn mel_filter_bank(sr: f32, n_fft: f32, n_mels: usize, fmin: f32, fmax: f32) -> 
 
     let mel_min = 2595.0 * (1.0 + fmin / 700.0).log10();
     let mel_max = 2595.0 * (1.0 + fmax / 700.0).log10();
-
+    
     let mels = (0..(n_mels + 2)).map(|i| {
         let m = mel_min + (mel_max - mel_min) * i as f32 / (n_mels as f32 + 1.0);
         700.0 * (10.0f32.powf(m / 2595.0) - 1.0)
@@ -184,10 +191,10 @@ fn mel_filter_bank(sr: f32, n_fft: f32, n_mels: usize, fmin: f32, fmax: f32) -> 
     for i in 0..n_mels {
         let width = mels[i + 2] - mels[i];
         let norm_factor = 2.0 / width;
-
+        
         let mut col = weights.slice_mut(ndarray::s![.., i]);
         col.mapv_inplace(|x| x * norm_factor);
     }
-
+    
     weights
 }

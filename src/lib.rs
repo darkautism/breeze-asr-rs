@@ -10,14 +10,6 @@ use crate::audio::AudioProcessor;
 use crate::model::BreezeModel;
 use crate::tokenizer::Tokenizer;
 
-#[derive(Debug, Clone)]
-pub struct VoiceText {
-    pub language: String,
-    pub emotion: String,
-    pub event: String,
-    pub content: String,
-}
-
 pub struct BreezeASR {
     model: BreezeModel,
     tokenizer: Tokenizer,
@@ -57,10 +49,10 @@ impl BreezeASR {
         }
 
         let model = BreezeModel::new(
-            encoder_path.to_str().unwrap(),
+            encoder_path.to_str().unwrap(), 
             decoder_path.to_str().unwrap()
         )?;
-
+        
         let tokenizer = Tokenizer::new(tokenizer_path.to_str().unwrap())?;
         let audio_processor = AudioProcessor::new()?;
 
@@ -71,16 +63,11 @@ impl BreezeASR {
         })
     }
 
-    pub fn infer_file(&self, path: &str) -> Result<Vec<VoiceText>> {
+    pub fn infer_file(&self, path: &str) -> Result<Vec<String>> {
         let mel = self.audio_processor.load_and_preprocess(path)?;
         let tokens = self.model.infer(&mel)?;
         let text = self.tokenizer.decode(&tokens);
 
-        Ok(vec![VoiceText {
-            language: "zh".to_string(),
-            emotion: "Unknown".to_string(),
-            event: "Unknown".to_string(),
-            content: text,
-        }])
+        Ok(vec![text])
     }
 }
